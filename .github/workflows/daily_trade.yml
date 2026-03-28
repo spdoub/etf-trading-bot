@@ -1,0 +1,76 @@
+name: Daily ETF Trade
+
+on:
+  schedule:
+    # 9:15 AM Eastern (UTC-4 during EDT, which covers most of the trading year).
+    # During EST (Nov–Mar) this fires at 8:15 AM ET — still before market open.
+    - cron: "15 13 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── Setup ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── Run pipeline ───────────────────────────────────────────────────
+      - name: Run trading pipeline
+        id: pipeline
+        continue-on-error: true
+        env:
+          GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
+          ALPACA_API_KEY:     ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY:  ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_PAPER:       ${{ secrets.ALPACA_PAPER }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          SAM_GOV_API_KEY:    ${{ secrets.SAM_GOV_API_KEY }}
+          USAJOBS_API_KEY:    ${{ secrets.USAJOBS_API_KEY }}
+          USAJOBS_EMAIL:      ${{ secrets.USAJOBS_EMAIL }}
+        run: python main.py
+
+      # ── Persist database ───────────────────────────────────────────────
+      - name: Commit database changes
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "No database changes to commit"
+          else
+            git commit -m "📊 Daily trade data — $(date -u +%Y-%m-%d)"
+            git pull --rebase
+            git push
+          fi
+
+      # ── Artifacts for debugging ────────────────────────────────────────
+      - name: Upload bot log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-log-${{ github.run_id }}
+          path: bot.log
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # ── Propagate pipeline failure to workflow status ───────────────────
+      - name: Fail workflow if pipeline failed
+        if: steps.pipeline.outcome == 'failure'
+        run: exit 1
