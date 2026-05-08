@@ -1,5 +1,7 @@
 # ETF Trading Bot
 
+Canonical Git remote: [https://github.com/spdoub/etf-trading-bot](https://github.com/spdoub/etf-trading-bot) (the account tied to Cursor’s GitHub MCP).
+
 Automated ETF trading bot that combines news sentiment (Groq LLM), alternative data feeds, and multi-timeframe technical signals to generate and execute trades on Alpaca Markets. Sends a daily summary via Telegram.
 
 ## Architecture
