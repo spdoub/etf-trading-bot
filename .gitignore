@@ -5,3 +5,4 @@ bot.log
 .venv/
 *.db-wal
 *.db-shm
+.streamlit/secrets.toml

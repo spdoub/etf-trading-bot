@@ -7,8 +7,8 @@ trades             one row per trade action (buy / sell / hold)
 daily_portfolio    end-of-day snapshot with holdings, cash, returns
 strategy_signals   three-layer strategy output per day
 
-The database defaults to ``data/etf_bot.db`` inside the repository so
-it persists across GitHub Actions runs when committed back to the repo.
+The database defaults to ``data/etf_bot.db`` inside the project so
+it lives with the repo for backup and portability.
 """
 
 from __future__ import annotations
@@ -151,6 +151,27 @@ def get_today_sentiment() -> dict | None:
     d = dict(row)
     d["scores"] = json.loads(d.pop("scores_json"))
     return d
+
+
+def get_sentiment_history_detail(days_back: int = 30) -> list[dict]:
+    """Historical sentiment rows with full *scores* dict (score + reasoning per ETF)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT date, scores_json, source_count, created_at FROM daily_sentiment "
+        "WHERE date >= ? ORDER BY date DESC",
+        (cutoff,),
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "date": r["date"],
+            "source_count": r["source_count"],
+            "created_at": r["created_at"],
+            "scores": json.loads(r["scores_json"]),
+        }
+        for r in rows
+    ]
 
 
 def get_sentiment_history(days_back: int = 30) -> list[dict]:
@@ -432,3 +453,15 @@ def insert_error(step_name: str, error_message: str) -> int:
     rid = cur.lastrowid
     conn.close()
     return rid
+
+
+def get_error_history(days_back: int = 90) -> list[dict]:
+    """Pipeline error rows newest first."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT * FROM errors WHERE date >= ? ORDER BY created_at DESC",
+        (cutoff,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]

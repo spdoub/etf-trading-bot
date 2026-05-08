@@ -6,7 +6,6 @@ response as a dated markdown file in ``reviews/``, and sends a summary
 to Telegram.
 
 Run manually:  python review.py
-Scheduled:     1st of each month via GitHub Actions
 """
 
 from __future__ import annotations
@@ -18,7 +17,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from groq import Groq, RateLimitError, InternalServerError, APIConnectionError
+from groq import (
+    Groq,
+    APIStatusError,
+    RateLimitError,
+    InternalServerError,
+    APIConnectionError,
+)
 from dotenv import load_dotenv
 
 from database import (
@@ -44,10 +49,15 @@ log = logging.getLogger("review")
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 REVIEWS_DIR = _PROJECT_ROOT / "reviews"
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
+)
 ALL_TIME_DAYS = 3650
 MAX_DAILY_LOG_ROWS = 180
-MAX_PROMPT_CHARS = 90_000
+MAX_PROMPT_CHARS = int(os.getenv("GROQ_REVIEW_MAX_PROMPT_CHARS", "55000"))
+GROQ_REVIEW_INPUT_TOKEN_BUDGET = int(
+    os.getenv("GROQ_REVIEW_INPUT_TOKEN_BUDGET", "26500")
+)
 MAX_RETRIES = 3
 BACKOFF_S = 3.0
 
@@ -180,8 +190,10 @@ def _daily_log(
     portfolio: list[dict],
     signals: list[dict],
     trades: list[dict],
+    max_rows: int | None = None,
 ) -> str:
     """One row per trading day: recommendation, action, return, value."""
+    row_cap = max_rows if max_rows is not None else MAX_DAILY_LOG_ROWS
     port_map = {d["date"]: d for d in portfolio}
     sig_map = {d["date"]: d for d in signals}
     trade_map: dict[str, list[dict]] = {}
@@ -189,8 +201,8 @@ def _daily_log(
         trade_map.setdefault(t["date"], []).append(t)
 
     dates = sorted(set(list(port_map) + list(sig_map)))
-    if len(dates) > MAX_DAILY_LOG_ROWS:
-        dates = dates[-MAX_DAILY_LOG_ROWS:]
+    if len(dates) > row_cap:
+        dates = dates[-row_cap:]
 
     lines = ["Date       | Rec  | Conf  | Action    | Day Ret  | Value"]
     lines.append("-" * 64)
@@ -353,12 +365,19 @@ def _sentiment_drift(sentiment: list[dict]) -> str:
 # Prompt assembly
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _rough_review_input_tokens(system: str, user: str) -> int:
+    return max(1, (len(system) + len(user)) // 3)
+
+
 def _build_prompt(
     portfolio: list[dict],
     signals: list[dict],
     trades: list[dict],
     sentiment: list[dict],
     stats: dict,
+    *,
+    max_prompt_chars: int | None = None,
+    max_daily_rows: int | None = None,
 ) -> str:
     best_s = (
         f"{stats['best'][0]} ({stats['best'][1]:+.2f}%)"
@@ -387,9 +406,12 @@ def _build_prompt(
         f"- Worst day: {worst_s}"
     )
 
+    mpc = max_prompt_chars if max_prompt_chars is not None else MAX_PROMPT_CHARS
+    mdr = max_daily_rows if max_daily_rows is not None else MAX_DAILY_LOG_ROWS
+
     daily = (
         "## DAILY PERFORMANCE LOG\n```\n"
-        + _daily_log(portfolio, signals, trades)
+        + _daily_log(portfolio, signals, trades, max_rows=mdr)
         + "\n```"
     )
     rotations = (
@@ -433,7 +455,7 @@ def _build_prompt(
     sections = [overview, daily, rotations, accuracy, drift, questions]
     full = "\n\n".join(sections)
 
-    if len(full) > MAX_PROMPT_CHARS:
+    if len(full) > mpc:
         trimmed_daily = (
             "## DAILY PERFORMANCE LOG\n"
             f"(Trimmed — {stats['days']} days recorded; see overview)"
@@ -546,15 +568,64 @@ def run_review() -> bool:
 
     stats = _compute_stats(portfolio, trades, signals)
 
-    log.info("Building review prompt …")
-    prompt_data = _build_prompt(portfolio, signals, trades, sentiment, stats)
-    log.info("Prompt: %d chars", len(prompt_data))
+    max_rows = MAX_DAILY_LOG_ROWS
+    max_chars = MAX_PROMPT_CHARS
+    analysis: str | None = None
+    prompt_data = ""
 
-    log.info("Sending to Groq [%s] for analysis …", GROQ_MODEL)
-    analysis = _call_groq([
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": prompt_data},
-    ])
+    for _ in range(22):
+        for _inner in range(50):
+            prompt_data = _build_prompt(
+                portfolio,
+                signals,
+                trades,
+                sentiment,
+                stats,
+                max_prompt_chars=max_chars,
+                max_daily_rows=max_rows,
+            )
+            if (
+                _rough_review_input_tokens(SYSTEM_PROMPT, prompt_data)
+                <= GROQ_REVIEW_INPUT_TOKEN_BUDGET
+            ):
+                break
+            max_rows = max(25, int(max_rows * 0.82))
+            max_chars = max(12000, int(max_chars * 0.88))
+        else:
+            raise RuntimeError(
+                "GROQ_REVIEW_INPUT_TOKEN_BUDGET is too low — increase it or "
+                "reduce GROQ_REVIEW_MAX_PROMPT_CHARS"
+            )
+
+        log.info(
+            "Review prompt: %d chars (~%d est. input tokens), daily row cap %d",
+            len(prompt_data),
+            _rough_review_input_tokens(SYSTEM_PROMPT, prompt_data),
+            max_rows,
+        )
+
+        log.info("Sending to Groq [%s] for analysis …", GROQ_MODEL)
+        try:
+            analysis = _call_groq([
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt_data},
+            ])
+            break
+        except APIStatusError as exc:
+            if exc.status_code != 413:
+                raise
+            log.warning(
+                "Groq 413 (request too large) — shrinking (rows=%d, char cap=%d)",
+                max_rows,
+                max_chars,
+            )
+            max_rows = max(25, int(max_rows * 0.55))
+            max_chars = max(12000, int(max_chars * 0.55))
+
+    if analysis is None:
+        raise RuntimeError(
+            "Monthly review: could not fit prompt under Groq input limits"
+        )
     log.info("Received analysis: %d chars", len(analysis))
 
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")

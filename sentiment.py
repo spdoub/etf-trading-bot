@@ -1,7 +1,7 @@
 """Sector-level sentiment scoring via Groq LLM.
 
 Takes the aggregated text from data_sources.collect_all() and sends it to
-Groq (llama-3.3-70b-versatile) to score sentiment across 8 major ETF
+Groq (default: Llama 4 Scout — 30K TPM on free tier) to score sentiment across 8 major ETF
 sectors on a -10 to +10 scale.  Returns a dict of sector scores + reasoning.
 """
 
@@ -14,7 +14,13 @@ import re
 import time
 from datetime import datetime, timezone
 
-from groq import Groq, RateLimitError, InternalServerError, APIConnectionError
+from groq import (
+    Groq,
+    APIStatusError,
+    RateLimitError,
+    InternalServerError,
+    APIConnectionError,
+)
 from dotenv import load_dotenv
 
 from database import insert_daily_sentiment
@@ -26,10 +32,16 @@ log = logging.getLogger(__name__)
 # Configuration
 # ═══════════════════════════════════════════════════════════════════════════
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Default model: 30K TPM / 1K RPD (Groq console, on-demand). For llama-3.3-70b
+# (12K TPM) set GROQ_MODEL and tighten GROQ_INPUT_TOKEN_BUDGET + GROQ_SENTIMENT_MAX_DATA_CHARS.
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
+)
 MAX_RETRIES = 3
 INITIAL_BACKOFF_S = 2.0
-MAX_PROMPT_CHARS = 60_000
+# Conservative chars÷3 estimate of system+user tokens; stay under model TPM.
+GROQ_INPUT_TOKEN_BUDGET = int(os.getenv("GROQ_INPUT_TOKEN_BUDGET", "26500"))
+MAX_PROMPT_CHARS = int(os.getenv("GROQ_SENTIMENT_MAX_DATA_CHARS", "52000"))
 
 _client: Groq | None = None
 
@@ -87,10 +99,12 @@ CATEGORY_HEADERS: dict[str, str] = {
 }
 
 
-def _prepare_prompt_text(data: dict[str, list]) -> tuple[str, int]:
+def _prepare_prompt_text(
+    data: dict[str, list], max_chars: int = MAX_PROMPT_CHARS
+) -> tuple[str, int]:
     """Convert categorised DataItems into structured text for the LLM.
 
-    If the total character count exceeds MAX_PROMPT_CHARS, each category
+    If the total character count exceeds *max_chars*, each category
     is proportionally trimmed so the most-important items (which come
     first in each list) are preserved.
 
@@ -111,11 +125,11 @@ def _prepare_prompt_text(data: dict[str, list]) -> tuple[str, int]:
 
     full_text = "\n".join(sections)
 
-    if len(full_text) <= MAX_PROMPT_CHARS:
+    if len(full_text) <= max_chars:
         return full_text, total_items
 
     # Proportionally trim each category to fit the budget
-    ratio = MAX_PROMPT_CHARS / len(full_text)
+    ratio = max_chars / len(full_text)
     sections = []
     total_items = 0
     for cat_key, header in CATEGORY_HEADERS.items():
@@ -130,6 +144,11 @@ def _prepare_prompt_text(data: dict[str, list]) -> tuple[str, int]:
         sections.append("\n".join(lines))
 
     return "\n".join(sections), total_items
+
+
+def _rough_input_token_estimate(system: str, user: str) -> int:
+    """Conservative chars→tokens heuristic for Groq TPM checks (no tokenizer dep)."""
+    return max(1, (len(system) + len(user)) // 3)
 
 
 def _build_user_prompt(data_text: str, item_count: int) -> str:
@@ -296,20 +315,53 @@ def analyze(data: dict[str, list] | None = None) -> dict[str, dict]:
             "No data collected from any source — cannot produce fresh sentiment scores"
         )
 
-    data_text, item_count = _prepare_prompt_text(data)
-    user_prompt = _build_user_prompt(data_text, item_count)
+    max_chars = MAX_PROMPT_CHARS
+    raw: str | None = None
+    for _ in range(18):
+        data_text, item_count = _prepare_prompt_text(data, max_chars=max_chars)
+        user_prompt = _build_user_prompt(data_text, item_count)
+        for _ in range(40):
+            if (
+                _rough_input_token_estimate(SYSTEM_PROMPT, user_prompt)
+                <= GROQ_INPUT_TOKEN_BUDGET
+            ):
+                break
+            max_chars = max(2500, int(max_chars * 0.72))
+            data_text, item_count = _prepare_prompt_text(data, max_chars=max_chars)
+            user_prompt = _build_user_prompt(data_text, item_count)
+        else:
+            raise RuntimeError(
+                "GROQ_INPUT_TOKEN_BUDGET is too low — increase it or reduce prompt size"
+            )
 
-    log.info(
-        "Sending %d items (%d chars) to Groq [%s] for sector scoring",
-        item_count, len(data_text), GROQ_MODEL,
-    )
+        log.info(
+            "Sending %d items (%d data chars, ~%d est. input tokens) to Groq [%s]",
+            item_count,
+            len(data_text),
+            _rough_input_token_estimate(SYSTEM_PROMPT, user_prompt),
+            GROQ_MODEL,
+        )
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            raw = _call_groq(messages)
+            break
+        except APIStatusError as exc:
+            if exc.status_code != 413:
+                raise
+            log.warning(
+                "Groq 413 (request too large for TPM) — shrinking data cap from %d chars",
+                max_chars,
+            )
+            max_chars = max(2500, int(max_chars * 0.55))
 
-    raw = _call_groq(messages)
+    if raw is None:
+        raise RuntimeError(
+            "Could not fit sentiment prompt under Groq input limits after trimming"
+        )
     parsed = _extract_json(raw)
     result = _validate_scores(parsed)
 

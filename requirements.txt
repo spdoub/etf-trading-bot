@@ -9,3 +9,4 @@ numpy==2.2.4
 schedule==1.2.2
 python-telegram-bot==21.11
 aiohttp==3.11.14
+streamlit==1.45.0

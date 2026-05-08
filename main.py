@@ -6,11 +6,12 @@ Run on loop:    python main.py --schedule
 If Groq sentiment analysis fails for any reason the pipeline aborts
 immediately — no strategy, no trades, no guessing.  The failure is
 logged to the ``errors`` table, an alert is sent to Telegram, and the
-process exits with code 1 so GitHub Actions marks the run as failed.
+process exits with code 1 so callers (cron, CI, etc.) can detect failure.
 """
 
 import argparse
 import logging
+import os
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -129,8 +130,13 @@ def main() -> None:
         help="Run on a daily schedule (default: 09:35 ET) instead of once",
     )
     parser.add_argument(
-        "--time", default="13:35",
-        help="UTC time to run when using --schedule (HH:MM, default 13:35 ≈ 09:35 ET)",
+        "--time",
+        default=os.getenv("SCHEDULE_UTC_TIME", "13:35"),
+        help=(
+            "Time to run when using --schedule (HH:MM, 24h). On Railway the "
+            "container clock is usually UTC — default 13:35 UTC ≈ 09:35 ET. "
+            "Override with SCHEDULE_UTC_TIME."
+        ),
     )
     args = parser.parse_args()
 
