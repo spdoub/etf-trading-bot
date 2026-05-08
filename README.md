@@ -2,6 +2,8 @@
 
 Canonical Git remote: [https://github.com/spdoub/etf-trading-bot](https://github.com/spdoub/etf-trading-bot) (the account tied to Cursor’s GitHub MCP).
 
+The **Streamlit mission control** (`dashboard.py`) uses **Plotly** (equity curve, Turbo heatmap, radar, donut allocation). If **`ALPACA_*`** env vars are set on Railway, the UI shows a **read-only Alpaca** strip (equity / cash / clock). The trading database stays **SQLite** on your volume (`DB_PATH`); you do not need to add Railway Postgres for this app.
+
 Automated ETF trading bot that combines news sentiment (Groq LLM), alternative data feeds, and multi-timeframe technical signals to generate and execute trades on Alpaca Markets. Sends a daily summary via Telegram.
 
 ## Architecture
