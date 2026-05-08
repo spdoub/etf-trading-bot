@@ -17,6 +17,14 @@ main.py              → orchestrates the daily pipeline
 ├── dashboard.py     → Streamlit data UI (reads SQLite; used on Railway too)
 ```
 
+### Automated deploy from GitHub (no Railway MCP required)
+
+If **`RAILWAY_TOKEN`** is set in this repo’s **GitHub Actions secrets** (create a **project token** in Railway: Project → **Settings** → **Tokens**), pushes to **`main`** run `.github/workflows/railway-deploy.yml` and execute **`railway up --ci`**.
+
+Optional secret **`RAILWAY_SERVICE`**: exact service name if the project has more than one service.
+
+Until you add **`RAILWAY_TOKEN`**, that workflow is skipped so CI stays green.
+
 ## Deploy on Railway (scheduler + dashboard, no GitHub Actions)
 
 ### 1. Authenticate (required for MCP and CLI)

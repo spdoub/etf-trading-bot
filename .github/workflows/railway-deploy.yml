@@ -1,0 +1,41 @@
+# Deploy this repo to Railway using a project token (no interactive `railway login` in CI).
+#
+# One-time setup:
+# 1. railway.app → your project → Settings → Tokens → New project token
+# 2. GitHub → spdoub/etf-trading-bot → Settings → Secrets → Actions
+#    Add: RAILWAY_TOKEN = (paste token)
+# 3. If the project has more than one service, add secret RAILWAY_SERVICE = exact service name
+# 4. Push to main (or use "Run workflow") to deploy
+#
+# Alternatively, connect this repo inside Railway (Deploy from GitHub) and skip this workflow.
+
+name: Deploy to Railway
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: railway-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: ${{ secrets.RAILWAY_TOKEN != '' }}
+    runs-on: ubuntu-latest
+    container: ghcr.io/railwayapp/cli:latest
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: railway up
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ secrets.RAILWAY_SERVICE }}" ]]; then
+            railway up --ci --service "${{ secrets.RAILWAY_SERVICE }}"
+          else
+            railway up --ci
+          fi
